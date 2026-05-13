@@ -130,6 +130,99 @@ class ReservationSummaryParams(ReservationParams):
         description="Reservation service to summarize"
     )
 
+
+class ComputeOptimizerEC2Params(BaseModel):
+    """Parameters for EC2 Compute Optimizer recommendations."""
+    region: str = Field(
+        default="us-east-1",
+        description="AWS region to retrieve Compute Optimizer findings from"
+    )
+    aws_account_id: Optional[str] = Field(
+        description="AWS account id (if different from the current AWS account)",
+        default=None
+    )
+    finding: Optional[Literal["Underprovisioned", "Overprovisioned", "Optimized", "NotOptimized"]] = Field(
+        default=None,
+        description="Optional finding filter"
+    )
+    max_results: int = Field(
+        default=50,
+        ge=1,
+        le=1000,
+        description="Maximum number of recommendations to return"
+    )
+
+
+class ComputeOptimizerRDSParams(BaseModel):
+    """Parameters for RDS Compute Optimizer recommendations."""
+    region: str = Field(
+        default="us-east-1",
+        description="AWS region to retrieve Compute Optimizer findings from"
+    )
+    aws_account_id: Optional[str] = Field(
+        description="AWS account id (if different from the current AWS account)",
+        default=None
+    )
+    finding: Optional[Literal["Underprovisioned", "Overprovisioned", "Optimized", "NotOptimized"]] = Field(
+        default=None,
+        description="Optional finding filter"
+    )
+    max_results: int = Field(
+        default=50,
+        ge=1,
+        le=1000,
+        description="Maximum number of recommendations to return"
+    )
+
+
+class RightsizingRecommendationParams(BaseModel):
+    """Parameters for Cost Explorer rightsizing recommendations."""
+    region: str = Field(
+        default="us-east-1",
+        description="AWS region for Cost Explorer API"
+    )
+    aws_account_id: Optional[str] = Field(
+        description="AWS account id (if different from the current AWS account)",
+        default=None
+    )
+    service: Literal["AmazonEC2"] = Field(
+        default="AmazonEC2",
+        description="Service for rightsizing recommendation"
+    )
+    lookback_period: Literal["SEVEN_DAYS", "THIRTY_DAYS", "SIXTY_DAYS"] = Field(
+        default="THIRTY_DAYS",
+        description="Lookback period for rightsizing recommendation"
+    )
+    page_size: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Page size for rightsizing recommendation results"
+    )
+
+
+class SavingsPlansRecommendationParams(BaseModel):
+    """Parameters for Cost Explorer Savings Plans purchase recommendations."""
+    region: str = Field(
+        default="us-east-1",
+        description="AWS region for Cost Explorer API"
+    )
+    aws_account_id: Optional[str] = Field(
+        description="AWS account id (if different from the current AWS account)",
+        default=None
+    )
+    lookback_period: Literal["SEVEN_DAYS", "THIRTY_DAYS", "SIXTY_DAYS"] = Field(
+        default="THIRTY_DAYS",
+        description="Lookback period for Savings Plans recommendation"
+    )
+    payment_option: Literal["NO_UPFRONT", "PARTIAL_UPFRONT", "ALL_UPFRONT"] = Field(
+        default="NO_UPFRONT",
+        description="Savings Plans payment option"
+    )
+    term_in_years: Literal["ONE_YEAR", "THREE_YEARS"] = Field(
+        default="ONE_YEAR",
+        description="Savings Plans term"
+    )
 # global params
 # if we want to get AWS spend info from a different account we need to assume a role in that account
 # and while the account id would be provided by the user of this MCP server, we set the name of the role
@@ -348,6 +441,7 @@ def system_prompt_for_agent(aws_account_id: str = "") -> str:
 3. Resource tagging information
 4. Billing data by account, service, and region
 5. Historical spend pattern analysis
+6. AWS-native optimization recommendations (Cost Explorer and Compute Optimizer findings)
 
 When a user asks about their AWS costs:
 
@@ -1291,6 +1385,165 @@ def get_instance_type_breakdown(ce_client, date, region, service, dimension_key)
             return result_df
     
     return None
+
+
+@mcp.tool()
+async def get_compute_optimizer_ec2_recommendations(params: ComputeOptimizerEC2Params) -> Dict[str, Any]:
+    """
+    Retrieve AWS Compute Optimizer findings and recommendations for EC2 instances.
+    """
+    print(f"get_compute_optimizer_ec2_recommendations, params={params}")
+    client = get_aws_service_boto3_client("compute-optimizer", params.aws_account_id, params.region)
+
+    request: Dict[str, Any] = {
+        "maxResults": params.max_results
+    }
+    if params.finding:
+        request["filters"] = [
+            {
+                "name": "Finding",
+                "values": [params.finding]
+            }
+        ]
+
+    findings: List[Dict[str, Any]] = []
+    next_token: Optional[str] = None
+
+    try:
+        while True:
+            if next_token:
+                request["nextToken"] = next_token
+            response = client.get_ec2_instance_recommendations(**request)
+            findings.extend(response.get("instanceRecommendations", []))
+            next_token = response.get("nextToken")
+            if not next_token:
+                break
+
+        return {
+            "summary": {
+                "finding_filter": params.finding,
+                "total_recommendations": len(findings)
+            },
+            "recommendations": findings
+        }
+    except Exception as e:
+        return {"error": f"Error querying Compute Optimizer EC2 recommendations: {str(e)}"}
+
+
+@mcp.tool()
+async def get_compute_optimizer_rds_recommendations(params: ComputeOptimizerRDSParams) -> Dict[str, Any]:
+    """
+    Retrieve AWS Compute Optimizer findings and recommendations for RDS DB instances.
+    """
+    print(f"get_compute_optimizer_rds_recommendations, params={params}")
+    client = get_aws_service_boto3_client("compute-optimizer", params.aws_account_id, params.region)
+
+    request: Dict[str, Any] = {
+        "maxResults": params.max_results
+    }
+    if params.finding:
+        request["filters"] = [
+            {
+                "name": "Finding",
+                "values": [params.finding]
+            }
+        ]
+
+    findings: List[Dict[str, Any]] = []
+    next_token: Optional[str] = None
+
+    try:
+        while True:
+            if next_token:
+                request["nextToken"] = next_token
+            response = client.get_rds_database_recommendations(**request)
+            findings.extend(response.get("instanceRecommendations", []))
+            next_token = response.get("nextToken")
+            if not next_token:
+                break
+
+        return {
+            "summary": {
+                "finding_filter": params.finding,
+                "total_recommendations": len(findings)
+            },
+            "recommendations": findings
+        }
+    except Exception as e:
+        return {"error": f"Error querying Compute Optimizer RDS recommendations: {str(e)}"}
+
+
+@mcp.tool()
+async def get_cost_explorer_rightsizing_recommendations(params: RightsizingRecommendationParams) -> Dict[str, Any]:
+    """
+    Retrieve Cost Explorer rightsizing recommendations (EC2 only).
+    """
+    print(f"get_cost_explorer_rightsizing_recommendations, params={params}")
+    ce_client = get_aws_service_boto3_client("ce", params.aws_account_id, params.region)
+
+    request: Dict[str, Any] = {
+        "Service": params.service,
+        "Configuration": {
+            "RecommendationTarget": "SAME_INSTANCE_FAMILY",
+            "BenefitsConsidered": True,
+            "LookbackPeriodInDays": params.lookback_period
+        },
+        "PageSize": params.page_size
+    }
+
+    recommendations: List[Dict[str, Any]] = []
+    next_page_token: Optional[str] = None
+
+    try:
+        while True:
+            if next_page_token:
+                request["NextPageToken"] = next_page_token
+            response = ce_client.get_rightsizing_recommendation(**request)
+            recommendations.extend(response.get("RightsizingRecommendations", []))
+            next_page_token = response.get("NextPageToken")
+            if not next_page_token:
+                break
+
+        return {
+            "summary": {
+                "service": params.service,
+                "lookback_period": params.lookback_period,
+                "total_recommendations": len(recommendations)
+            },
+            "recommendations": recommendations
+        }
+    except Exception as e:
+        return {"error": f"Error querying Cost Explorer rightsizing recommendations: {str(e)}"}
+
+
+@mcp.tool()
+async def get_savings_plans_purchase_recommendations(params: SavingsPlansRecommendationParams) -> Dict[str, Any]:
+    """
+    Retrieve Cost Explorer Savings Plans purchase recommendations.
+    """
+    print(f"get_savings_plans_purchase_recommendations, params={params}")
+    ce_client = get_aws_service_boto3_client("ce", params.aws_account_id, params.region)
+
+    request: Dict[str, Any] = {
+        "SavingsPlansType": "COMPUTE_SP",
+        "TermInYears": params.term_in_years,
+        "PaymentOption": params.payment_option,
+        "LookbackPeriodInDays": params.lookback_period
+    }
+
+    try:
+        response = ce_client.get_savings_plans_purchase_recommendation(**request)
+        return {
+            "summary": {
+                "lookback_period": params.lookback_period,
+                "payment_option": params.payment_option,
+                "term_in_years": params.term_in_years
+            },
+            "recommendation_details": response.get("SavingsPlansPurchaseRecommendation", {})
+        }
+    except Exception as e:
+        return {"error": f"Error querying Savings Plans purchase recommendations: {str(e)}"}
+
 
 @mcp.resource("config://app")
 def get_config() -> str:

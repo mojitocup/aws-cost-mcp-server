@@ -227,6 +227,10 @@ The server exposes the following tools that Claude can use:
 1. **`get_rds_reservation_utilization(days=30, granularity='DAILY')`**: Retrieves RDS reservation utilization from Cost Explorer.
 1. **`get_rds_reservation_coverage(days=30, granularity='DAILY')`**: Retrieves RDS reservation coverage from Cost Explorer.
 1. **`get_reservation_health_summary(days=30, granularity='DAILY', service='BOTH')`**: Returns a human-friendly reservation report with utilization %, coverage %, unused hours, realized savings, and daily trend tables for EC2 and/or RDS.
+1. **`get_compute_optimizer_ec2_recommendations(region='us-east-1', finding=None, max_results=50)`**: Retrieves AWS Compute Optimizer findings and recommendations for EC2 instances.
+1. **`get_compute_optimizer_rds_recommendations(region='us-east-1', finding=None, max_results=50)`**: Retrieves AWS Compute Optimizer findings and recommendations for RDS DB instances.
+1. **`get_cost_explorer_rightsizing_recommendations(service='AmazonEC2', lookback_period='THIRTY_DAYS', page_size=20)`**: Retrieves AWS Cost Explorer rightsizing recommendations.
+1. **`get_savings_plans_purchase_recommendations(lookback_period='THIRTY_DAYS', payment_option='NO_UPFRONT', term_in_years='ONE_YEAR')`**: Retrieves Cost Explorer Savings Plans purchase recommendations.
 1. **`get_bedrock_daily_usage_stats(days=7, region='us-east-1', log_group_name='BedrockModelInvocationLogGroup')`**: Delivers a per-day breakdown of model usage by region and users.
 1. **`get_bedrock_hourly_usage_stats(days=7, region='us-east-1', log_group_name='BedrockModelInvocationLogGroup')`**: Delivers a per-day per-hour breakdown of model usage by region and users.
 
