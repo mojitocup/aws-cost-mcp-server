@@ -219,20 +219,29 @@ A browser window should open up on `localhost:8080` and you should be able to us
 
 The server exposes the following tools that Claude can use:
 
-1. **`get_ec2_spend_last_day()`**: Retrieves EC2 spending data for the previous day
-1. **`get_detailed_breakdown_by_day(days=7)`**: Delivers a comprehensive analysis of costs by region, service, and instance type
-1. **`query_cost_explorer_cost_and_usage(days=30, granularity='DAILY', metrics=['UnblendedCost'], group_by_dimension=None, service_filter=None)`**: Runs a generic AWS Cost Explorer `get_cost_and_usage` query for broader cost analysis.
+1. **`get_ec2_spend_last_day(ec2_record_type_filter=['Usage'])`**: Retrieves EC2 spending data for the previous day, grouped by instance type. Defaults to `RECORD_TYPE = Usage` so totals align with Console-style on-demand usage (excludes `RIFee` and similar line items that can distort instance-type `UnblendedCost`). Pass `ec2_record_type_filter=[]` for the legacy “all record types” behavior.
+1. **`get_detailed_breakdown_by_day(days=7, ec2_record_type_filter=['Usage'])`**: Delivers a comprehensive analysis of costs by region, service, and instance type. The nested **EC2** instance-type table uses the same `RECORD_TYPE` filter as `get_ec2_spend_last_day`; SageMaker breakdowns are unchanged.
+1. **`query_cost_explorer_cost_and_usage(..., record_type_filter=None)`**: Runs a generic AWS Cost Explorer `get_cost_and_usage` query. Optional `record_type_filter` (e.g. `['Usage']`) is AND-combined with `service_filter` when both are set.
 1. **`get_ec2_reservation_utilization(days=30, granularity='DAILY')`**: Retrieves EC2 Reserved Instance utilization from Cost Explorer.
 1. **`get_ec2_reservation_coverage(days=30, granularity='DAILY')`**: Retrieves EC2 Reserved Instance coverage from Cost Explorer.
 1. **`get_rds_reservation_utilization(days=30, granularity='DAILY')`**: Retrieves RDS reservation utilization from Cost Explorer.
 1. **`get_rds_reservation_coverage(days=30, granularity='DAILY')`**: Retrieves RDS reservation coverage from Cost Explorer.
 1. **`get_reservation_health_summary(days=30, granularity='DAILY', service='BOTH')`**: Returns a human-friendly reservation report with utilization %, coverage %, unused hours, realized savings, and daily trend tables for EC2 and/or RDS.
+1. **`get_ec2_regional_ri_flexibility_report(region='us-east-1', platform_scope='linux_unix')`**: Compares **active** regional EC2 RIs to **running** instances using AWS **normalization units** per instance family (so e.g. one **c5.4xlarge** RI pool vs two **c5.2xlarge** running can show as balanced). Includes a separate **zonal** RI table (exact `InstanceType` only, no cross-size pooling). Does not replace Cost Explorer for billing-hour truth; see tool docstring for limits.
 1. **`get_compute_optimizer_ec2_recommendations(region='us-east-1', finding=None, max_results=50)`**: Retrieves AWS Compute Optimizer findings and recommendations for EC2 instances.
 1. **`get_compute_optimizer_rds_recommendations(region='us-east-1', finding=None, max_results=50)`**: Retrieves AWS Compute Optimizer findings and recommendations for RDS DB instances.
 1. **`get_cost_explorer_rightsizing_recommendations(service='AmazonEC2', lookback_period='THIRTY_DAYS', page_size=20)`**: Retrieves AWS Cost Explorer rightsizing recommendations.
 1. **`get_savings_plans_purchase_recommendations(lookback_period='THIRTY_DAYS', payment_option='NO_UPFRONT', term_in_years='ONE_YEAR')`**: Retrieves Cost Explorer Savings Plans purchase recommendations.
 1. **`get_bedrock_daily_usage_stats(days=7, region='us-east-1', log_group_name='BedrockModelInvocationLogGroup')`**: Delivers a per-day breakdown of model usage by region and users.
 1. **`get_bedrock_hourly_usage_stats(days=7, region='us-east-1', log_group_name='BedrockModelInvocationLogGroup')`**: Delivers a per-day per-hour breakdown of model usage by region and users.
+
+### EC2 instance-type cost vs AWS Console coverage
+
+Grouping **`UnblendedCost` by `INSTANCE_TYPE`** without filtering **`RECORD_TYPE`** can include **reservation recurring fees (`RIFee`)** and other line items that the **Coverage** UI keeps separate from on-demand usage cost. For EC2, this server defaults to **`RECORD_TYPE = Usage`** (parameter `ec2_record_type_filter`, default `['Usage']`) on `get_ec2_spend_last_day` and on the nested EC2 instance-type table inside `get_detailed_breakdown_by_day`, so dollar amounts are closer to Console-style on-demand rows. Pass **`ec2_record_type_filter=[]`** to match the previous “all record types” behavior. For ad-hoc queries, use **`record_type_filter`** on `query_cost_explorer_cost_and_usage` (combined with `service_filter` when both are set).
+
+### EC2 Reserved Instance counts vs “real” coverage (instance size flexibility)
+
+A spreadsheet that compares **counts of RIs per instance type** to **counts of running instances per type** is misleading for **regional** Linux/UNIX RIs: AWS applies **instance size flexibility** within the same **family** using **normalization units** (for example, one **c5.4xlarge** reservation has the same footprint as two **c5.2xlarge**). Use **`get_ec2_regional_ri_flexibility_report`** for a family-level view that matches that model. **Zonal** RIs do not flex across sizes in the same way; the tool’s second table compares exact types in the RI’s Availability Zone. **Savings Plans** are not included in that EC2 API–based report.
 
 ### Example Queries
 
@@ -247,6 +256,8 @@ Once connected to Claude through an MCP-enabled interface, you can ask questions
 - "Show EC2 reservation utilization and coverage for the last 30 days"
 - "Show RDS reservation utilization and reservation coverage by day"
 - "Give me a reservation health summary for EC2 and RDS for the last month"
+- "Show EC2 cost by instance type for May using only Usage record types (like the coverage console)"
+- "Show my c5 family: regional RI normalization units vs running footprint (size flexibility)"
 
 ## Docker Support
 

@@ -5,6 +5,7 @@ This server provides MCP tools to interact with AWS Cost Explorer API.
 """
 import os
 import argparse
+import re
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Union, Literal
@@ -65,6 +66,14 @@ class EC2Params(BaseModel):
         description="AWS account id (if different from the current AWS account) of the account for which to get the cost data",
         default=None
     )
+    ec2_record_type_filter: List[str] = Field(
+        default_factory=lambda: ["Usage"],
+        description=(
+            "Cost Explorer RECORD_TYPE values included for EC2 spend-by-instance-type and nested EC2 instance breakdowns. "
+            "Default ['Usage'] matches Console-style on-demand usage rows and excludes RIFee / DiscountedUsage amortization "
+            "that can spike UnblendedCost when grouped by INSTANCE_TYPE. Pass an empty list to disable (legacy all record types)."
+        ),
+    )
 
 
 class CostExplorerQueryParams(BaseModel):
@@ -99,6 +108,13 @@ class CostExplorerQueryParams(BaseModel):
         description="AWS account id (if different from the current AWS account) of the account for which to get the cost data",
         default=None
     )
+    record_type_filter: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Optional Cost Explorer RECORD_TYPE filter (AND with service_filter if set). "
+            "Use e.g. ['Usage'] to align instance-type costs with on-demand-style rows; omit for all record types."
+        ),
+    )
 
 
 class ReservationParams(BaseModel):
@@ -128,6 +144,23 @@ class ReservationSummaryParams(ReservationParams):
     service: Literal["EC2", "RDS", "BOTH"] = Field(
         default="BOTH",
         description="Reservation service to summarize"
+    )
+
+
+class EC2RIFlexibilityReportParams(BaseModel):
+    """Parameters for EC2 regional RI instance-size flexibility vs running footprint."""
+
+    region: str = Field(
+        default="us-east-1",
+        description="AWS region to query EC2 APIs in",
+    )
+    aws_account_id: Optional[str] = Field(
+        default=None,
+        description="AWS account id (if different from the current AWS account)",
+    )
+    platform_scope: Literal["linux_unix", "windows", "all"] = Field(
+        default="linux_unix",
+        description="Which OS family to include when matching RIs to running instances (instance size flexibility applies per AWS rules; linux_unix is the common regional flexible case).",
     )
 
 
@@ -289,7 +322,30 @@ def get_aws_service_boto3_client(service: str, aws_account_id: Optional[str], re
     except Exception as e:
         print(f"Error creating cross-account client for {service}: {e}")
         raise e
-    
+
+
+def _cost_explorer_dimension_filter(
+    *,
+    service_values: Optional[List[str]] = None,
+    record_type_values: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Build a Cost Explorer Filter combining SERVICE and/or RECORD_TYPE dimensions.
+
+    When both are present, wraps them in an And expression (required by the API).
+    """
+    clauses: List[Dict[str, Any]] = []
+    if service_values:
+        clauses.append({"Dimensions": {"Key": "SERVICE", "Values": service_values}})
+    if record_type_values:
+        clauses.append({"Dimensions": {"Key": "RECORD_TYPE", "Values": record_type_values}})
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"And": clauses}
+
+
 def get_bedrock_logs(params: BedrockLogsParams) -> Optional[pd.DataFrame]:
     """
     Retrieve Bedrock invocation logs for the last n days in a given region as a dataframe
@@ -442,6 +498,7 @@ def system_prompt_for_agent(aws_account_id: str = "") -> str:
 4. Billing data by account, service, and region
 5. Historical spend pattern analysis
 6. AWS-native optimization recommendations (Cost Explorer and Compute Optimizer findings)
+7. EC2 regional Reserved Instance capacity vs running footprint (AWS normalization units for instance size flexibility)
 
 When a user asks about their AWS costs:
 
@@ -803,6 +860,10 @@ def get_bedrock_hourly_usage_stats(params: BedrockLogsParams) -> str:
 async def get_ec2_spend_last_day(params: EC2Params) -> Dict[str, Any]:
     """
     Retrieve EC2 spend for the last day using standard AWS Cost Explorer API.
+
+    By default, filters to RECORD_TYPE Usage so instance-type UnblendedCost aligns with
+    Console-style on-demand usage (reservation recurring fees are excluded). Set
+    ec2_record_type_filter to [] to include all record types.
     
     Returns:
         Dict[str, Any]: The raw response from the AWS Cost Explorer API, or None if an error occurs.
@@ -815,6 +876,11 @@ async def get_ec2_spend_last_day(params: EC2Params) -> Dict[str, Any]:
     # Calculate the time period - last day
     end_date = datetime.now().strftime('%Y-%m-%d')
     start_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    ce_filter = _cost_explorer_dimension_filter(
+        service_values=["Amazon Elastic Compute Cloud - Compute"],
+        record_type_values=params.ec2_record_type_filter or None,
+    )
     
     try:
         # Make the API call using get_cost_and_usage (standard API)
@@ -824,14 +890,7 @@ async def get_ec2_spend_last_day(params: EC2Params) -> Dict[str, Any]:
                 'End': end_date
             },
             Granularity='DAILY',
-            Filter={
-                'Dimensions': {
-                    'Key': 'SERVICE',
-                    'Values': [
-                        'Amazon Elastic Compute Cloud - Compute'
-                    ]
-                }
-            },
+            Filter=ce_filter,
             Metrics=[
                 'UnblendedCost',
                 'UsageQuantity'
@@ -894,6 +953,10 @@ async def get_ec2_spend_last_day(params: EC2Params) -> Dict[str, Any]:
 async def get_detailed_breakdown_by_day(params: EC2Params) -> str: #Dict[str, Any]:
     """
     Retrieve daily spend breakdown by region, service, and instance type.
+
+    EC2 nested instance-type rows use ec2_record_type_filter (default RECORD_TYPE Usage)
+    so costs are comparable to Console coverage / on-demand views; pass an empty list
+    to include reservation fees and other record types in those rows.
     
     Args:
         params: Parameters specifying the number of days to look back
@@ -998,7 +1061,8 @@ async def get_detailed_breakdown_by_day(params: EC2Params) -> str: #Dict[str, An
                                 date, 
                                 region, 
                                 'Amazon Elastic Compute Cloud - Compute', 
-                                'INSTANCE_TYPE'
+                                'INSTANCE_TYPE',
+                                record_type_filter=params.ec2_record_type_filter or None,
                             )
                             
                             if instance_response:
@@ -1099,13 +1163,12 @@ async def query_cost_explorer_cost_and_usage(params: CostExplorerQueryParams) ->
             }
         ]
 
-    if params.service_filter:
-        request["Filter"] = {
-            "Dimensions": {
-                "Key": "SERVICE",
-                "Values": [params.service_filter]
-            }
-        }
+    ce_filter = _cost_explorer_dimension_filter(
+        service_values=[params.service_filter] if params.service_filter else None,
+        record_type_values=params.record_type_filter or None,
+    )
+    if ce_filter:
+        request["Filter"] = ce_filter
 
     try:
         return ce_client.get_cost_and_usage(**request)
@@ -1311,7 +1374,322 @@ async def get_reservation_health_summary(params: ReservationSummaryParams) -> st
 
     return "\n".join(report)
 
-def get_instance_type_breakdown(ce_client, date, region, service, dimension_key):
+
+# AWS normalization factors for regional Linux/UNIX instance size flexibility (units).
+# Source: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ri-modifying.html
+RI_FLEX_INSTANCE_SIZE_NORMALIZATION: Dict[str, float] = {
+    "nano": 0.25,
+    "micro": 0.5,
+    "small": 1.0,
+    "medium": 2.0,
+    "large": 4.0,
+    "xlarge": 8.0,
+    "2xlarge": 16.0,
+    "3xlarge": 24.0,
+    "4xlarge": 32.0,
+    "6xlarge": 48.0,
+    "8xlarge": 64.0,
+    "9xlarge": 72.0,
+    "10xlarge": 80.0,
+    "12xlarge": 96.0,
+    "16xlarge": 128.0,
+    "18xlarge": 144.0,
+    "24xlarge": 192.0,
+    "32xlarge": 256.0,
+    "48xlarge": 384.0,
+    "52xlarge": 416.0,
+    "56xlarge": 448.0,
+    "112xlarge": 896.0,
+}
+
+# Bare metal uses family-specific factors (same table as AWS docs).
+RI_FLEX_METAL_NORMALIZATION: Dict[str, float] = {
+    "a1.metal": 32.0,
+    "c6g.metal": 128.0,
+    "c6gd.metal": 128.0,
+    "i3.metal": 128.0,
+    "m6g.metal": 128.0,
+    "m6gd.metal": 128.0,
+    "r6g.metal": 128.0,
+    "r6gd.metal": 128.0,
+    "x2gd.metal": 128.0,
+    "c5n.metal": 144.0,
+    "c5.metal": 192.0,
+    "c5d.metal": 192.0,
+    "i3en.metal": 192.0,
+    "m5.metal": 192.0,
+    "m5d.metal": 192.0,
+    "m5dn.metal": 192.0,
+    "m5n.metal": 192.0,
+    "r5.metal": 192.0,
+    "r5b.metal": 192.0,
+    "r5d.metal": 192.0,
+    "r5dn.metal": 192.0,
+    "r5n.metal": 192.0,
+    "c6i.metal": 256.0,
+    "c6id.metal": 256.0,
+    "m6i.metal": 256.0,
+    "m6id.metal": 256.0,
+    "r6d.metal": 256.0,
+    "r6id.metal": 256.0,
+    "u-18tb1.metal": 448.0,
+    "u-24tb1.metal": 448.0,
+    "u-6tb1.metal": 896.0,
+    "u-9tb1.metal": 896.0,
+    "u-12tb1.metal": 896.0,
+}
+
+
+def _parse_instance_family_size(instance_type: str) -> tuple[str, str]:
+    if "." not in instance_type:
+        return instance_type, "unknown"
+    family, size = instance_type.rsplit(".", 1)
+    return family, size
+
+
+def _ri_flexibility_normalization_units(instance_type: str) -> tuple[Optional[float], Optional[str]]:
+    _family, size = _parse_instance_family_size(instance_type)
+    if size == "unknown":
+        return None, f"Unrecognized instance type format: {instance_type}"
+    if size == "metal":
+        factor = RI_FLEX_METAL_NORMALIZATION.get(instance_type)
+        if factor is not None:
+            return factor, None
+        return None, f"Unknown bare metal type for normalization: {instance_type}"
+    if size in RI_FLEX_INSTANCE_SIZE_NORMALIZATION:
+        return RI_FLEX_INSTANCE_SIZE_NORMALIZATION[size], None
+    m = re.match(r"^(\d+)xlarge$", size)
+    if m:
+        return float(int(m.group(1))) * 8.0, None
+    return None, f"Unknown instance size token '{size}' on {instance_type}"
+
+
+def _ri_product_platform_bucket(product_description: str) -> str:
+    pd = product_description or ""
+    if pd.startswith("Windows"):
+        return "windows"
+    if (
+        pd.startswith("Linux")
+        or pd.startswith("Red Hat")
+        or pd.startswith("SUSE")
+        or "Ubuntu" in pd
+    ):
+        return "linux"
+    return "other"
+
+
+def _instance_platform_bucket(platform_details: str) -> str:
+    pd = platform_details or ""
+    if pd.startswith("Windows"):
+        return "windows"
+    if (
+        pd.startswith("Linux")
+        or pd.startswith("Red Hat")
+        or pd.startswith("SUSE")
+        or pd.startswith("Ubuntu")
+    ):
+        return "linux"
+    return "other"
+
+
+def _platform_scope_matches(bucket: str, platform_scope: str) -> bool:
+    if bucket == "other":
+        return False
+    if platform_scope == "all":
+        return bucket in ("linux", "windows")
+    if platform_scope == "linux_unix":
+        return bucket == "linux"
+    if platform_scope == "windows":
+        return bucket == "windows"
+    return False
+
+
+@mcp.tool()
+async def get_ec2_regional_ri_flexibility_report(params: EC2RIFlexibilityReportParams) -> str:
+    """
+    Compare active EC2 Reserved Instance capacity to running instances using AWS **normalization units**
+    within each instance **family** (regional RIs with instance size flexibility).
+
+    Simple per–instance-type counts (e.g. 7× c5.xlarge RIs vs 3× c5.xlarge running) ignore flexibility:
+    a **c5.4xlarge** regional Linux RI can cover **2× c5.2xlarge** running in the same family. This report
+    sums **purchased** and **running** footprints in the same unit space so those cases show as balanced.
+
+    **Limitations**: Uses live `DescribeReservedInstances` / `DescribeInstances` (not Cost Explorer hour
+    history). **Zonal** RIs do **not** get cross-size pooling here (see AZ section). Savings Plans,
+    capacity blocks, and some marketplace OS RIs are not modeled. Windows flexibility rules differ;
+    use `platform_scope` accordingly.
+    """
+    print(f"get_ec2_regional_ri_flexibility_report, params={params}")
+    ec2 = get_aws_service_boto3_client("ec2", params.aws_account_id, params.region)
+
+    warnings: List[str] = []
+
+    # (platform_bucket, family, tenancy) -> normalization units
+    regional_ri_units: Dict[tuple[str, str, str], float] = defaultdict(float)
+    regional_run_units: Dict[tuple[str, str, str], float] = defaultdict(float)
+
+    # Zonal: (az, instance_type, tenancy) -> reserved count vs running count (no cross-size flex)
+    zonal_ri_count: Dict[tuple[str, str, str], int] = defaultdict(int)
+    zonal_run_count: Dict[tuple[str, str, str], int] = defaultdict(int)
+
+    try:
+        ri_paginator = ec2.get_paginator("describe_reserved_instances")
+        for page in ri_paginator.paginate(Filters=[{"Name": "state", "Values": ["active"]}]):
+            for ri in page.get("ReservedInstances", []):
+                product = ri.get("ProductDescription") or ""
+                bucket = _ri_product_platform_bucket(product)
+                if not _platform_scope_matches(bucket, params.platform_scope):
+                    continue
+                itype = ri.get("InstanceType") or ""
+                tenancy = ri.get("InstanceTenancy") or "default"
+                count = int(ri.get("InstanceCount") or 0)
+                scope = ri.get("Scope") or ""
+                units, warn = _ri_flexibility_normalization_units(itype)
+                if warn:
+                    warnings.append(warn)
+                if units is None or count <= 0:
+                    continue
+                family, _size = _parse_instance_family_size(itype)
+                if scope == "Region":
+                    regional_ri_units[(bucket, family, tenancy)] += units * count
+                elif scope == "Availability Zone":
+                    az = ri.get("AvailabilityZone") or ""
+                    zonal_ri_count[(az, itype, tenancy)] += count
+    except Exception as e:
+        return f"Error listing Reserved Instances: {e}"
+
+    try:
+        inst_paginator = ec2.get_paginator("describe_instances")
+        for page in inst_paginator.paginate(
+            Filters=[{"Name": "instance-state-name", "Values": ["running"]}]
+        ):
+            for resv in page.get("Reservations", []):
+                for inst in resv.get("Instances", []):
+                    platform_details = inst.get("PlatformDetails") or ""
+                    bucket = _instance_platform_bucket(platform_details)
+                    if not _platform_scope_matches(bucket, params.platform_scope):
+                        continue
+                    itype = inst.get("InstanceType") or ""
+                    if not itype:
+                        continue
+                    tenancy = (inst.get("Placement") or {}).get("Tenancy") or "default"
+                    units, warn = _ri_flexibility_normalization_units(itype)
+                    if warn:
+                        warnings.append(warn)
+                    if units is None:
+                        continue
+                    family, _size = _parse_instance_family_size(itype)
+                    regional_run_units[(bucket, family, tenancy)] += units
+                    az = (inst.get("Placement") or {}).get("AvailabilityZone") or ""
+                    zonal_run_count[(az, itype, tenancy)] += 1
+    except Exception as e:
+        return f"Error listing running instances: {e}"
+
+    lines: List[str] = [
+        f"EC2 Regional RI flexibility vs running footprint — region {params.region}",
+        f"Platform scope: {params.platform_scope}",
+        "=" * 88,
+        "",
+        "Regional scope (instance size flexibility within family / tenancy / OS bucket):",
+        "  Purchased RI units and Running units use the same AWS normalization scale (e.g. 1× 4xlarge = 2× 2xlarge).",
+        "",
+    ]
+
+    keys = sorted(set(regional_ri_units.keys()) | set(regional_run_units.keys()))
+    rows: List[Dict[str, Any]] = []
+    for key in keys:
+        bucket, family, tenancy = key
+        ri_u = regional_ri_units.get(key, 0.0)
+        run_u = regional_run_units.get(key, 0.0)
+        if ri_u == 0 and run_u == 0:
+            continue
+        surplus = max(0.0, ri_u - run_u)
+        gap = max(0.0, run_u - ri_u)
+        if run_u > 0:
+            pct_shape = round(100.0 * min(ri_u, run_u) / run_u, 1)
+        else:
+            pct_shape = None
+        rows.append(
+            {
+                "OS": bucket,
+                "Family": family,
+                "Tenancy": tenancy,
+                "RI units": round(ri_u, 2),
+                "Running units": round(run_u, 2),
+                "RI surplus": round(surplus, 2),
+                "Run gap": round(gap, 2),
+                "% shape covered": pct_shape if pct_shape is not None else "n/a",
+            }
+        )
+
+    if rows:
+        lines.append(tabulate(pd.DataFrame(rows), headers="keys", tablefmt="pretty", showindex=False))
+    else:
+        lines.append("(No matching regional RI or running data for this scope.)")
+
+    lines.extend(
+        [
+            "",
+            "Zonal Reserved Instances (no cross-size pooling in this report):",
+            "  Compares exact InstanceType in the RI's Availability Zone to running count in that AZ.",
+            "",
+        ]
+    )
+
+    z_keys = sorted(set(zonal_ri_count.keys()) | set(zonal_run_count.keys()))
+    z_rows: List[Dict[str, Any]] = []
+    for zk in z_keys:
+        az, itype, tenancy = zk
+        rc = zonal_ri_count.get(zk, 0)
+        runc = zonal_run_count.get(zk, 0)
+        if rc == 0 and runc == 0:
+            continue
+        z_rows.append(
+            {
+                "AZ": az,
+                "InstanceType": itype,
+                "Tenancy": tenancy,
+                "Zonal RI qty": rc,
+                "Running qty": runc,
+                "Diff (run - RI)": runc - rc,
+            }
+        )
+
+    if z_rows:
+        lines.append(tabulate(pd.DataFrame(z_rows), headers="keys", tablefmt="pretty", showindex=False))
+    else:
+        lines.append("(No active zonal Reserved Instances in this account/region.)")
+
+    lines.extend(
+        [
+            "",
+            "Notes:",
+            "- Regional Linux/UNIX Standard RIs typically share a normalization pool per instance family; this table reflects that.",
+            "- For billing-hour accuracy (including credits and mixed purchases), prefer Cost Explorer reservation APIs.",
+            "- Unknown instance sizes or bare metal types not in the mapping are skipped and listed below.",
+        ]
+    )
+
+    if warnings:
+        uniq = sorted(set(warnings))
+        lines.append("")
+        lines.append("Warnings / skipped items:")
+        for w in uniq[:50]:
+            lines.append(f"  - {w}")
+        if len(uniq) > 50:
+            lines.append(f"  ... and {len(uniq) - 50} more")
+
+    return "\n".join(lines)
+
+
+def get_instance_type_breakdown(
+    ce_client,
+    date: str,
+    region: str,
+    service: str,
+    dimension_key: str,
+    record_type_filter: Optional[List[str]] = None,
+):
     """
     Helper function to get instance type or usage type breakdown for a specific service.
     
@@ -1321,34 +1699,45 @@ def get_instance_type_breakdown(ce_client, date, region, service, dimension_key)
         region: The AWS region
         service: The AWS service name
         dimension_key: The dimension to group by (e.g., 'INSTANCE_TYPE' or 'USAGE_TYPE')
+        record_type_filter: Optional RECORD_TYPE dimension values (e.g. ['Usage'] for EC2
+            on-demand-style costs). Omitted or empty: no RECORD_TYPE filter.
     
     Returns:
         DataFrame containing the breakdown or None if no data
     """
     tomorrow = (datetime.strptime(date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
-    
+
+    and_clauses: List[Dict[str, Any]] = [
+        {
+            'Dimensions': {
+                'Key': 'REGION',
+                'Values': [region]
+            }
+        },
+        {
+            'Dimensions': {
+                'Key': 'SERVICE',
+                'Values': [service]
+            }
+        },
+    ]
+    if record_type_filter:
+        and_clauses.append(
+            {
+                'Dimensions': {
+                    'Key': 'RECORD_TYPE',
+                    'Values': record_type_filter,
+                }
+            }
+        )
+
     instance_response = ce_client.get_cost_and_usage(
         TimePeriod={
             'Start': date,
             'End': tomorrow
         },
         Granularity='DAILY',
-        Filter={
-            'And': [
-                {
-                    'Dimensions': {
-                        'Key': 'REGION',
-                        'Values': [region]
-                    }
-                },
-                {
-                    'Dimensions': {
-                        'Key': 'SERVICE',
-                        'Values': [service]
-                    }
-                }
-            ]
-        },
+        Filter={'And': and_clauses},
         Metrics=['UnblendedCost'],
         GroupBy=[
             {
